@@ -5,13 +5,17 @@ NotificationHandler: subscribes to AgentResponseEvent and delivers to Telegram.
 """
 
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import structlog
 
 from ..claude.facade import ClaudeIntegration
+from ..github.label_workflow import post_comment_and_swap_labels, post_error_comment
 from .bus import Event, EventBus
 from .types import AgentResponseEvent, ScheduledEvent, WebhookEvent
+
+# Only act on GitHub label events for this label
+_TRIGGER_LABEL = "waiting-for-ai"
 
 logger = structlog.get_logger()
 
@@ -42,12 +46,99 @@ class AgentHandler:
         self.event_bus.subscribe(ScheduledEvent, self.handle_scheduled)
 
     async def handle_webhook(self, event: Event) -> None:
-        """Process a webhook event through Claude."""
+        """Process a webhook event through Claude.
+
+        For GitHub events, only acts on ``issues`` and ``pull_request`` events
+        where the action is ``labeled`` and the label is ``waiting-for-ai``.
+        All other events are silently ignored (the HTTP server already returned
+        200 to GitHub).
+
+        On success, Claude's response is posted back as a GitHub comment and
+        the labels are swapped (waiting-for-ai → waiting-for-human).
+        On failure, an error comment is posted without touching labels so the
+        developer can see what happened and retry.
+        """
         if not isinstance(event, WebhookEvent):
             return
 
+        # --- GitHub label filter ---
+        if event.provider == "github":
+            action = event.payload.get("action")
+            label_name = event.payload.get("label", {}).get("name", "")
+            event_type = event.event_type_name
+
+            if not (
+                event_type in ("issues", "pull_request")
+                and action == "labeled"
+                and label_name == _TRIGGER_LABEL
+            ):
+                logger.debug(
+                    "Ignoring non-actionable GitHub webhook",
+                    event_type=event_type,
+                    action=action,
+                    label=label_name,
+                    delivery_id=event.delivery_id,
+                )
+                return
+
+            # Extract repo + number for the response step
+            gh_repo: Optional[str] = (
+                event.payload.get("repository", {}).get("full_name")
+            )
+            issue_or_pr = event.payload.get("issue") or event.payload.get("pull_request") or {}
+            gh_number: Optional[int] = issue_or_pr.get("number")
+            gh_kind = "pr" if event_type == "pull_request" else "issue"
+
+            logger.info(
+                "Processing waiting-for-ai GitHub event",
+                repo=gh_repo,
+                number=gh_number,
+                kind=gh_kind,
+                delivery_id=event.delivery_id,
+            )
+
+            prompt = self._build_github_prompt(event)
+
+            try:
+                response = await self.claude.run_command(
+                    prompt=prompt,
+                    working_directory=self.default_working_directory,
+                    user_id=self.default_user_id,
+                )
+
+                if response.content and gh_repo and gh_number:
+                    await post_comment_and_swap_labels(
+                        repo=gh_repo,
+                        number=gh_number,
+                        kind=gh_kind,
+                        response_text=response.content,
+                    )
+                    # Also notify via Telegram if chat IDs are configured
+                    await self.event_bus.publish(
+                        AgentResponseEvent(
+                            chat_id=0,
+                            text=response.content,
+                            originating_event_id=event.id,
+                        )
+                    )
+            except Exception as exc:
+                logger.exception(
+                    "Agent execution failed for GitHub webhook event",
+                    repo=gh_repo,
+                    number=gh_number,
+                    event_id=event.id,
+                )
+                if gh_repo and gh_number:
+                    await post_error_comment(
+                        repo=gh_repo,
+                        number=gh_number,
+                        error=str(exc),
+                    )
+            return
+
+        # --- Non-GitHub generic webhook (original behaviour) ---
         logger.info(
-            "Processing webhook event through agent",
+            "Processing generic webhook event through agent",
             provider=event.provider,
             event_type=event.event_type_name,
             delivery_id=event.delivery_id,
@@ -133,8 +224,44 @@ class AgentHandler:
                 event_id=event.id,
             )
 
+    def _build_github_prompt(self, event: WebhookEvent) -> str:
+        """Build a rich, actionable prompt for a GitHub issue or PR label event."""
+        payload = event.payload
+        repo = payload.get("repository", {}).get("full_name", "unknown/repo")
+        event_type = event.event_type_name
+
+        if event_type == "pull_request":
+            pr = payload.get("pull_request", {})
+            head = pr.get("head", {}).get("ref", "?")
+            base = pr.get("base", {}).get("ref", "?")
+            return (
+                f"A GitHub pull request has been labelled `{_TRIGGER_LABEL}` "
+                f"and needs your attention.\n\n"
+                f"Repository: {repo}\n"
+                f"PR #{pr.get('number')}: {pr.get('title')}  [{head} → {base}]\n"
+                f"URL: {pr.get('html_url')}\n\n"
+                f"Description:\n{pr.get('body') or '(no description)'}\n\n"
+                f"Please review any open review comments on the PR. Make any requested "
+                f"code changes, push them to the branch, and post a summary comment on "
+                f"the PR when done using `gh pr comment`. Do not merge the PR yourself."
+            )
+        else:
+            issue = payload.get("issue", {})
+            return (
+                f"A GitHub issue has been labelled `{_TRIGGER_LABEL}` "
+                f"and needs your attention.\n\n"
+                f"Repository: {repo}\n"
+                f"Issue #{issue.get('number')}: {issue.get('title')}\n"
+                f"URL: {issue.get('html_url')}\n\n"
+                f"Body:\n{issue.get('body') or '(no description)'}\n\n"
+                f"Please read the issue carefully and take the appropriate action — "
+                f"implement the request, answer the question, or ask a clarifying "
+                f"question. When done, post your response as a comment on the issue "
+                f"using `gh issue comment`."
+            )
+
     def _build_webhook_prompt(self, event: WebhookEvent) -> str:
-        """Build a Claude prompt from a webhook event."""
+        """Build a Claude prompt from a generic (non-GitHub) webhook event."""
         payload_summary = self._summarize_payload(event.payload)
 
         return (
