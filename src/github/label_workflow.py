@@ -1,9 +1,10 @@
 """GitHub label-based workflow helpers.
 
-Provides utilities for the waiting-for-ai / waiting-for-human handoff pattern:
+Provides utilities for the waiting-for-ai / action-ready handoff pattern:
 - Post Claude's response as a comment on the originating issue or PR
-- Swap the waiting-for-ai label to waiting-for-human on success
-- Post a visible error comment (without swapping labels) on failure so the
+- Remove waiting-for-ai or action-ready on success (no waiting-for-human —
+  anything without a trigger label is implicitly the human's turn)
+- Post a visible error comment and apply ai-error on failure so the
   developer knows a retry is needed
 """
 
@@ -15,25 +16,28 @@ import structlog
 logger = structlog.get_logger()
 
 LABEL_WAITING_FOR_AI = "waiting-for-ai"
-LABEL_WAITING_FOR_HUMAN = "waiting-for-human"
+LABEL_ACTION_READY = "action-ready"
+LABEL_AI_ERROR = "ai-error"
 
 
-async def post_comment_and_swap_labels(
+async def post_comment_and_remove_label(
     repo: str,
     number: int,
     kind: Literal["issue", "pr"],
     response_text: str,
+    trigger_label: str = LABEL_WAITING_FOR_AI,
 ) -> None:
-    """Post Claude's response as a comment and swap labels.
+    """Post Claude's response as a comment and remove the trigger label.
 
-    Removes ``waiting-for-ai`` and applies ``waiting-for-human`` so the
-    developer knows the ball is back in their court.
+    No replacement label is applied — anything without a trigger label is
+    implicitly the human's turn.
 
     Args:
         repo: Full repository name, e.g. ``"jemmy8oy/web-template"``.
         number: Issue or PR number.
         kind: ``"issue"`` or ``"pr"``.
         response_text: The text to post as a GitHub comment.
+        trigger_label: The label to remove (waiting-for-ai or action-ready).
     """
     comment_cmd = (
         ["gh", "issue", "comment", str(number), "--repo", repo, "--body", response_text]
@@ -48,17 +52,17 @@ async def post_comment_and_swap_labels(
         [
             "gh", "issue", "edit", str(number),
             "--repo", repo,
-            "--remove-label", LABEL_WAITING_FOR_AI,
-            "--add-label", LABEL_WAITING_FOR_HUMAN,
+            "--remove-label", trigger_label,
         ],
-        context=f"{repo}#{number} label swap",
+        context=f"{repo}#{number} remove {trigger_label}",
     )
 
     logger.info(
-        "Posted comment and swapped labels",
+        "Posted comment and removed trigger label",
         repo=repo,
         number=number,
         kind=kind,
+        trigger_label=trigger_label,
     )
 
 
@@ -66,28 +70,38 @@ async def post_error_comment(
     repo: str,
     number: int,
     error: str,
+    trigger_label: str = LABEL_WAITING_FOR_AI,
 ) -> None:
-    """Post a visible error comment without touching labels.
+    """Post a visible error comment and apply the ai-error label.
 
-    Leaves ``waiting-for-ai`` in place (or lets the developer decide what to
-    do), and makes the failure visible on the issue/PR so nothing silently
-    disappears.
+    Removes the trigger label and applies ``ai-error`` so the failure is
+    visible at a glance in the issue list and the bot won't re-trigger.
 
     Args:
         repo: Full repository name.
         number: Issue or PR number.
         error: Short error description to include in the comment.
+        trigger_label: The label that triggered this run (to be removed).
     """
     body = (
         f"⚠️ **Claude encountered an error** and could not complete this task.\n\n"
         f"```\n{error}\n```\n\n"
-        f"Please review the logs, then re-apply `{LABEL_WAITING_FOR_AI}` when ready to retry."
+        f"Please review the logs, then re-apply `{trigger_label}` when ready to retry."
     )
     await _run(
         ["gh", "issue", "comment", str(number), "--repo", repo, "--body", body],
         context=f"{repo}#{number} error comment",
     )
-    logger.warning("Posted error comment", repo=repo, number=number, error=error)
+    await _run(
+        [
+            "gh", "issue", "edit", str(number),
+            "--repo", repo,
+            "--remove-label", trigger_label,
+            "--add-label", LABEL_AI_ERROR,
+        ],
+        context=f"{repo}#{number} apply ai-error",
+    )
+    logger.warning("Posted error comment and applied ai-error", repo=repo, number=number, error=error)
 
 
 async def _run(cmd: list, context: str = "") -> None:
