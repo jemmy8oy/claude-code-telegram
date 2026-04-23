@@ -90,7 +90,8 @@ class AgentHandler:
             gh_repo: Optional[str] = (
                 event.payload.get("repository", {}).get("full_name")
             )
-            issue_or_pr = event.payload.get("issue") or event.payload.get("pull_request") or {}
+            issue_or_pr = event.payload.get(
+                "issue") or event.payload.get("pull_request") or {}
             gh_number: Optional[int] = issue_or_pr.get("number")
             gh_kind = "pr" if event_type == "pull_request" else "issue"
             # action-ready is for issues only — PRs use waiting-for-ai for all work
@@ -105,7 +106,8 @@ class AgentHandler:
                 delivery_id=event.delivery_id,
             )
 
-            prompt = self._build_github_prompt(event, action_ready=is_action_ready)
+            prompt = self._build_github_prompt(
+                event, action_ready=is_action_ready)
 
             try:
                 response = await self.claude.run_command(
@@ -253,36 +255,42 @@ class AgentHandler:
                 f"A GitHub pull request has been labelled `{label}` "
                 f"and needs your attention.\n\n"
                 f"Repository: {repo}\n"
-                f"PR #{pr.get('number')}: {pr.get('title')}  [{head} → {base}]\n"
+                f"PR #{pr.get('number')}: {pr.get(
+                    'title')}  [{head} → {base}]\n"
                 f"URL: {pr.get('html_url')}\n\n"
                 f"Description:\n{pr.get('body') or '(no description)'}\n\n"
                 f"Please review any open review comments on the PR. Make any requested "
                 f"code changes, push them to the branch, and post a summary comment on "
                 f"the PR when done using `gh pr comment`. Do not merge the PR yourself."
+                f"Remember to run ```export GH_TOKEN=$(python3 /data/workspace/refresh_gh.py)``` if you need to reauth with gh."
             )
         else:
             issue = payload.get("issue", {})
             if action_ready:
                 instruction = (
-                    f"This issue is marked `{LABEL_ACTION_READY}` — implement the task "
+                    f"This issue is marked `{
+                        LABEL_ACTION_READY}` — implement the task "
                     f"described. Clone the repo if needed, make the changes, and raise a PR. "
                     f"Post a comment on the issue linking the PR when done."
                 )
             else:
                 instruction = (
-                    f"This issue is marked `{LABEL_WAITING_FOR_AI}` — read it carefully and "
+                    f"This issue is marked `{
+                        LABEL_WAITING_FOR_AI}` — read it carefully and "
                     f"respond with a comment. You may ask clarifying questions or provide your "
                     f"analysis, but do NOT start implementing. Post your response using "
                     f"`gh issue comment` and nothing else."
                 )
             label = LABEL_ACTION_READY if action_ready else LABEL_WAITING_FOR_AI
             return (
-                f"A GitHub issue has been labelled `{label}` and needs your attention.\n\n"
+                f"A GitHub issue has been labelled `{
+                    label}` and needs your attention.\n\n"
                 f"Repository: {repo}\n"
                 f"Issue #{issue.get('number')}: {issue.get('title')}\n"
                 f"URL: {issue.get('html_url')}\n\n"
                 f"Body:\n{issue.get('body') or '(no description)'}\n\n"
                 f"{instruction}"
+                f"Remember to run ```export GH_TOKEN=$(python3 /data/workspace/refresh_gh.py)``` if you need to reauth with gh."
             )
 
     def _build_webhook_prompt(self, event: WebhookEvent) -> str:
@@ -324,7 +332,8 @@ class AgentHandler:
             for key, value in data.items():
                 full_key = f"{prefix}.{key}" if prefix else key
                 if isinstance(value, (dict, list)):
-                    self._flatten_dict(value, lines, full_key, depth + 1, max_depth)
+                    self._flatten_dict(
+                        value, lines, full_key, depth + 1, max_depth)
                 else:
                     val_str = str(value)
                     if len(val_str) > 200:
@@ -333,6 +342,7 @@ class AgentHandler:
         elif isinstance(data, list):
             lines.append(f"{prefix}: [{len(data)} items]")
             for i, item in enumerate(data[:3]):  # Show first 3 items
-                self._flatten_dict(item, lines, f"{prefix}[{i}]", depth + 1, max_depth)
+                self._flatten_dict(
+                    item, lines, f"{prefix}[{i}]", depth + 1, max_depth)
         else:
             lines.append(f"{prefix}: {data}")
