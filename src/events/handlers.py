@@ -10,12 +10,17 @@ from typing import Any, Dict, List, Optional
 import structlog
 
 from ..claude.facade import ClaudeIntegration
-from ..github.label_workflow import post_comment_and_swap_labels, post_error_comment
+from ..github.label_workflow import (
+    LABEL_ACTION_READY,
+    LABEL_WAITING_FOR_AI,
+    post_comment_and_remove_label,
+    post_error_comment,
+)
 from .bus import Event, EventBus
 from .types import AgentResponseEvent, ScheduledEvent, WebhookEvent
 
-# Only act on GitHub label events for this label
-_TRIGGER_LABEL = "waiting-for-ai"
+# Labels that trigger Claude on issues/PRs
+_TRIGGER_LABELS = {LABEL_WAITING_FOR_AI, LABEL_ACTION_READY}
 
 logger = structlog.get_logger()
 
@@ -70,7 +75,7 @@ class AgentHandler:
             if not (
                 event_type in ("issues", "pull_request")
                 and action == "labeled"
-                and label_name == _TRIGGER_LABEL
+                and label_name in _TRIGGER_LABELS
             ):
                 logger.debug(
                     "Ignoring non-actionable GitHub webhook",
@@ -88,16 +93,18 @@ class AgentHandler:
             issue_or_pr = event.payload.get("issue") or event.payload.get("pull_request") or {}
             gh_number: Optional[int] = issue_or_pr.get("number")
             gh_kind = "pr" if event_type == "pull_request" else "issue"
+            is_action_ready = label_name == LABEL_ACTION_READY
 
             logger.info(
-                "Processing waiting-for-ai GitHub event",
+                "Processing GitHub label event",
                 repo=gh_repo,
                 number=gh_number,
                 kind=gh_kind,
+                label=label_name,
                 delivery_id=event.delivery_id,
             )
 
-            prompt = self._build_github_prompt(event)
+            prompt = self._build_github_prompt(event, action_ready=is_action_ready)
 
             try:
                 response = await self.claude.run_command(
@@ -107,11 +114,12 @@ class AgentHandler:
                 )
 
                 if response.content and gh_repo and gh_number:
-                    await post_comment_and_swap_labels(
+                    await post_comment_and_remove_label(
                         repo=gh_repo,
                         number=gh_number,
                         kind=gh_kind,
                         response_text=response.content,
+                        trigger_label=label_name,
                     )
                     # Also notify via Telegram if chat IDs are configured
                     await self.event_bus.publish(
@@ -133,6 +141,7 @@ class AgentHandler:
                         repo=gh_repo,
                         number=gh_number,
                         error=str(exc),
+                        trigger_label=label_name,
                     )
             return
 
@@ -224,8 +233,12 @@ class AgentHandler:
                 event_id=event.id,
             )
 
-    def _build_github_prompt(self, event: WebhookEvent) -> str:
-        """Build a rich, actionable prompt for a GitHub issue or PR label event."""
+    def _build_github_prompt(self, event: WebhookEvent, action_ready: bool = False) -> str:
+        """Build a rich prompt for a GitHub issue or PR label event.
+
+        ``waiting-for-ai`` → discussion mode: read, respond, ask questions.
+        ``action-ready``   → implementation mode: implement the task, raise a PR.
+        """
         payload = event.payload
         repo = payload.get("repository", {}).get("full_name", "unknown/repo")
         event_type = event.event_type_name
@@ -234,8 +247,9 @@ class AgentHandler:
             pr = payload.get("pull_request", {})
             head = pr.get("head", {}).get("ref", "?")
             base = pr.get("base", {}).get("ref", "?")
+            label = LABEL_ACTION_READY if action_ready else LABEL_WAITING_FOR_AI
             return (
-                f"A GitHub pull request has been labelled `{_TRIGGER_LABEL}` "
+                f"A GitHub pull request has been labelled `{label}` "
                 f"and needs your attention.\n\n"
                 f"Repository: {repo}\n"
                 f"PR #{pr.get('number')}: {pr.get('title')}  [{head} → {base}]\n"
@@ -247,17 +261,27 @@ class AgentHandler:
             )
         else:
             issue = payload.get("issue", {})
+            if action_ready:
+                instruction = (
+                    f"This issue is marked `{LABEL_ACTION_READY}` — implement the task "
+                    f"described. Clone the repo if needed, make the changes, and raise a PR. "
+                    f"Post a comment on the issue linking the PR when done."
+                )
+            else:
+                instruction = (
+                    f"This issue is marked `{LABEL_WAITING_FOR_AI}` — read it carefully and "
+                    f"respond with a comment. You may ask clarifying questions or provide your "
+                    f"analysis, but do NOT start implementing. Post your response using "
+                    f"`gh issue comment` and nothing else."
+                )
+            label = LABEL_ACTION_READY if action_ready else LABEL_WAITING_FOR_AI
             return (
-                f"A GitHub issue has been labelled `{_TRIGGER_LABEL}` "
-                f"and needs your attention.\n\n"
+                f"A GitHub issue has been labelled `{label}` and needs your attention.\n\n"
                 f"Repository: {repo}\n"
                 f"Issue #{issue.get('number')}: {issue.get('title')}\n"
                 f"URL: {issue.get('html_url')}\n\n"
                 f"Body:\n{issue.get('body') or '(no description)'}\n\n"
-                f"Please read the issue carefully and take the appropriate action — "
-                f"implement the request, answer the question, or ask a clarifying "
-                f"question. When done, post your response as a comment on the issue "
-                f"using `gh issue comment`."
+                f"{instruction}"
             )
 
     def _build_webhook_prompt(self, event: WebhookEvent) -> str:
