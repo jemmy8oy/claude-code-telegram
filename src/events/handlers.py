@@ -93,7 +93,8 @@ class AgentHandler:
             issue_or_pr = event.payload.get("issue") or event.payload.get("pull_request") or {}
             gh_number: Optional[int] = issue_or_pr.get("number")
             gh_kind = "pr" if event_type == "pull_request" else "issue"
-            is_action_ready = label_name == LABEL_ACTION_READY
+            # action-ready is for issues only — PRs use waiting-for-ai for all work
+            is_action_ready = label_name == LABEL_ACTION_READY and gh_kind == "issue"
 
             logger.info(
                 "Processing GitHub label event",
