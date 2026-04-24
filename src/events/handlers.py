@@ -107,6 +107,16 @@ class AgentHandler:
 
             prompt = self._build_github_prompt(event, action_ready=is_action_ready)
 
+            # Notify Telegram that work is starting, before Claude runs
+            issue_title = issue_or_pr.get("title", "")
+            await self.event_bus.publish(
+                AgentResponseEvent(
+                    chat_id=0,
+                    text=f'⏳ Picked up {gh_repo}#{gh_number} "{issue_title}" — working on it...',
+                    originating_event_id=event.id,
+                )
+            )
+
             try:
                 response = await self.claude.run_command(
                     prompt=prompt,
