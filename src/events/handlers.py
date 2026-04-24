@@ -109,10 +109,11 @@ class AgentHandler:
 
             # Notify Telegram that work is starting, before Claude runs
             issue_title = issue_or_pr.get("title", "")
+            kind_label = "PR" if gh_kind == "pr" else "issue"
             await self.event_bus.publish(
                 AgentResponseEvent(
                     chat_id=0,
-                    text=f'⏳ Picked up {gh_repo}#{gh_number} "{issue_title}" — working on it...',
+                    text=f'⏳ Picked up {kind_label} {gh_repo}#{gh_number} "{issue_title}" — working on it...',
                     originating_event_id=event.id,
                 )
             )
