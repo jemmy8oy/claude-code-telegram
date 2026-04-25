@@ -124,44 +124,21 @@ class AgentHandler:
                 )
             )
 
-            try:
-                response = await self.claude.run_command(
+            # Schedule Claude work as a background task so the EventBus
+            # dispatch loop is not blocked during the long-running
+            # run_command() call.  Returning here lets the event bus
+            # immediately process and deliver the pickup notification
+            # above before Claude even starts.
+            asyncio.create_task(
+                self._run_github_task(
+                    event=event,
                     prompt=prompt,
-                    working_directory=self.default_working_directory,
-                    user_id=self.default_user_id,
-                    force_new=True,
+                    gh_repo=gh_repo,
+                    gh_number=gh_number,
+                    gh_kind=gh_kind,
+                    label_name=label_name,
                 )
-
-                if response.content and gh_repo and gh_number:
-                    await post_comment_and_remove_label(
-                        repo=gh_repo,
-                        number=gh_number,
-                        kind=gh_kind,
-                        response_text=response.content,
-                        trigger_label=label_name,
-                    )
-                    # Also notify via Telegram if chat IDs are configured
-                    await self.event_bus.publish(
-                        AgentResponseEvent(
-                            chat_id=0,
-                            text=response.content,
-                            originating_event_id=event.id,
-                        )
-                    )
-            except Exception as exc:
-                logger.exception(
-                    "Agent execution failed for GitHub webhook event",
-                    repo=gh_repo,
-                    number=gh_number,
-                    event_id=event.id,
-                )
-                if gh_repo and gh_number:
-                    await post_error_comment(
-                        repo=gh_repo,
-                        number=gh_number,
-                        error=str(exc),
-                        trigger_label=label_name,
-                    )
+            )
             return
 
         # --- Non-GitHub generic webhook (original behaviour) ---
@@ -251,6 +228,61 @@ class AgentHandler:
                 job_id=event.job_id,
                 event_id=event.id,
             )
+
+    async def _run_github_task(
+        self,
+        event: Event,
+        prompt: str,
+        gh_repo: Optional[str],
+        gh_number: Optional[int],
+        gh_kind: str,
+        label_name: str,
+    ) -> None:
+        """Execute Claude for a GitHub webhook event in the background.
+
+        Separated from handle_webhook() so that asyncio.create_task() can
+        schedule this without blocking the EventBus dispatch loop.  This
+        guarantees the pickup notification is delivered to Telegram before
+        the long-running run_command() call begins.
+        """
+        try:
+            response = await self.claude.run_command(
+                prompt=prompt,
+                working_directory=self.default_working_directory,
+                user_id=self.default_user_id,
+                force_new=True,
+            )
+
+            if response.content and gh_repo and gh_number:
+                await post_comment_and_remove_label(
+                    repo=gh_repo,
+                    number=gh_number,
+                    kind=gh_kind,
+                    response_text=response.content,
+                    trigger_label=label_name,
+                )
+                # Also notify via Telegram if chat IDs are configured
+                await self.event_bus.publish(
+                    AgentResponseEvent(
+                        chat_id=0,
+                        text=response.content,
+                        originating_event_id=event.id,
+                    )
+                )
+        except Exception as exc:
+            logger.exception(
+                "Agent execution failed for GitHub webhook event",
+                repo=gh_repo,
+                number=gh_number,
+                event_id=event.id,
+            )
+            if gh_repo and gh_number:
+                await post_error_comment(
+                    repo=gh_repo,
+                    number=gh_number,
+                    error=str(exc),
+                    trigger_label=label_name,
+                )
 
     async def _refresh_gh_token(self) -> None:
         """Refresh GH_TOKEN via the refresh script before each webhook task.
