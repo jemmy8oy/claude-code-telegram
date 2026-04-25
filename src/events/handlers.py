@@ -329,8 +329,10 @@ class AgentHandler:
                 f"URL: {pr.get('html_url')}\n\n"
                 f"Description:\n{pr.get('body') or '(no description)'}\n\n"
                 f"Please review any open review comments on the PR. Make any requested "
-                f"code changes, push them to the branch, and post a summary comment on "
-                f"the PR when done using `gh pr comment`. Do not merge the PR yourself."
+                f"code changes and push them to the branch. Do not merge the PR yourself.\n"
+                f"Write your response (summary of changes made) as plain text — "
+                f"do NOT call `gh pr comment` or `gh issue comment`; the system will "
+                f"post your text output as a comment automatically.\n"
                 f"Remember to run ```export GH_TOKEN=$(python3 /data/workspace/refresh_gh.py)``` if you need to reauth with gh."
             )
         else:
@@ -339,14 +341,17 @@ class AgentHandler:
                 instruction = (
                     f"This issue is marked `{LABEL_ACTION_READY}` — implement the task "
                     f"described. Clone the repo if needed, make the changes, and raise a PR. "
-                    f"Post a comment on the issue linking the PR when done."
+                    f"Write your response (including the PR link) as plain text — "
+                    f"do NOT call `gh issue comment`; the system will post your text "
+                    f"output as a comment automatically."
                 )
             else:
                 instruction = (
                     f"This issue is marked `{LABEL_WAITING_FOR_AI}` — read it carefully and "
-                    f"respond with a comment. You may ask clarifying questions or provide your "
-                    f"analysis, but do NOT start implementing. Post your response using "
-                    f"`gh issue comment` and nothing else."
+                    f"respond with your analysis or clarifying questions. "
+                    f"Do NOT start implementing. "
+                    f"Write your response as plain text — do NOT call `gh issue comment`; "
+                    f"the system will post your text output as a comment automatically."
                 )
             label = LABEL_ACTION_READY if action_ready else LABEL_WAITING_FOR_AI
             return (
@@ -355,7 +360,7 @@ class AgentHandler:
                 f"Issue #{issue.get('number')}: {issue.get('title')}\n"
                 f"URL: {issue.get('html_url')}\n\n"
                 f"Body:\n{issue.get('body') or '(no description)'}\n\n"
-                f"{instruction}"
+                f"{instruction}\n"
                 f"Remember to run ```export GH_TOKEN=$(python3 /data/workspace/refresh_gh.py)``` if you need to reauth with gh."
             )
 
