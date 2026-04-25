@@ -4,6 +4,8 @@ AgentHandler: translates events into ClaudeIntegration.run_command() calls.
 NotificationHandler: subscribes to AgentResponseEvent and delivers to Telegram.
 """
 
+import asyncio
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -107,6 +109,10 @@ class AgentHandler:
 
             prompt = self._build_github_prompt(event, action_ready=is_action_ready)
 
+            # Refresh GH_TOKEN before every task — keeps the agent's gh CLI
+            # authenticated without relying on in-session recovery instructions.
+            await self._refresh_gh_token()
+
             # Notify Telegram that work is starting, before Claude runs
             issue_title = issue_or_pr.get("title", "")
             kind_label = "PR" if gh_kind == "pr" else "issue"
@@ -123,6 +129,7 @@ class AgentHandler:
                     prompt=prompt,
                     working_directory=self.default_working_directory,
                     user_id=self.default_user_id,
+                    force_new=True,
                 )
 
                 if response.content and gh_repo and gh_number:
@@ -243,6 +250,28 @@ class AgentHandler:
                 "Agent execution failed for scheduled event",
                 job_id=event.job_id,
                 event_id=event.id,
+            )
+
+    async def _refresh_gh_token(self) -> None:
+        """Refresh GH_TOKEN via the refresh script before each webhook task.
+
+        Tokens from GitHub App installations expire after one hour. Refreshing
+        before every task ensures the agent's ``gh`` CLI calls succeed without
+        needing in-session recovery instructions.
+        """
+        proc = await asyncio.create_subprocess_exec(
+            "python3", "/data/workspace/refresh_gh.py",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode == 0:
+            os.environ["GH_TOKEN"] = stdout.decode().strip()
+            logger.debug("GH_TOKEN refreshed successfully")
+        else:
+            logger.warning(
+                "GH_TOKEN refresh failed — proceeding with existing token",
+                stderr=stderr.decode("utf-8", errors="replace").strip(),
             )
 
     def _build_github_prompt(self, event: WebhookEvent, action_ready: bool = False) -> str:
