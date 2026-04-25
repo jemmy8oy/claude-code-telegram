@@ -1,9 +1,12 @@
 """GitHub label-based workflow helpers.
 
 Provides utilities for the waiting-for-ai / action-ready handoff pattern:
-- Post Claude's response as a comment on the originating issue or PR
 - Remove waiting-for-ai or action-ready on success (no waiting-for-human —
   anything without a trigger label is implicitly the human's turn)
+- Post Claude's response as a comment on the originating issue or PR
+  (kept for legacy / testing use; the preferred flow is for Claude to post
+  its own comment via ``gh issue comment`` and the system only removes the
+  label via ``remove_trigger_label``).
 - Post a visible error comment and apply ai-error on failure so the
   developer knows a retry is needed
 """
@@ -62,6 +65,40 @@ async def post_comment_and_remove_label(
         repo=repo,
         number=number,
         kind=kind,
+        trigger_label=trigger_label,
+    )
+
+
+async def remove_trigger_label(
+    repo: str,
+    number: int,
+    trigger_label: str = LABEL_WAITING_FOR_AI,
+) -> None:
+    """Remove the trigger label from an issue or PR without posting a comment.
+
+    Used when Claude has already posted its own response via ``gh issue comment``
+    or ``gh pr comment`` and the system only needs to clear the label so the
+    issue returns to the human's queue.
+
+    Args:
+        repo: Full repository name, e.g. ``"jemmy8oy/web-template"``.
+        number: Issue or PR number.
+        trigger_label: The label to remove (waiting-for-ai or action-ready).
+    """
+    # gh issue edit works for both issues and PRs for label management
+    await _run(
+        [
+            "gh", "issue", "edit", str(number),
+            "--repo", repo,
+            "--remove-label", trigger_label,
+        ],
+        context=f"{repo}#{number} remove {trigger_label}",
+    )
+
+    logger.info(
+        "Removed trigger label",
+        repo=repo,
+        number=number,
         trigger_label=trigger_label,
     )
 

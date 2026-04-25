@@ -15,8 +15,8 @@ from ..claude.facade import ClaudeIntegration
 from ..github.label_workflow import (
     LABEL_ACTION_READY,
     LABEL_WAITING_FOR_AI,
-    post_comment_and_remove_label,
     post_error_comment,
+    remove_trigger_label,
 )
 from .bus import Event, EventBus
 from .types import AgentResponseEvent, ScheduledEvent, WebhookEvent
@@ -253,15 +253,19 @@ class AgentHandler:
                 force_new=True,
             )
 
-            if response.content and gh_repo and gh_number:
-                await post_comment_and_remove_label(
+            if gh_repo and gh_number:
+                # Claude has already posted its own GitHub comment via
+                # `gh issue comment` / `gh pr comment` as instructed in the
+                # prompt.  We only need to remove the trigger label here so
+                # the issue returns to the human's queue — posting a second
+                # comment programmatically would cause double replies.
+                await remove_trigger_label(
                     repo=gh_repo,
                     number=gh_number,
-                    kind=gh_kind,
-                    response_text=response.content,
                     trigger_label=label_name,
                 )
-                # Also notify via Telegram if chat IDs are configured
+            # Notify Telegram with Claude's response summary
+            if response.content:
                 await self.event_bus.publish(
                     AgentResponseEvent(
                         chat_id=0,

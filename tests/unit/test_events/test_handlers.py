@@ -233,7 +233,7 @@ class TestAgentHandler:
         event = self._make_github_label_event()
 
         with (
-            patch("src.events.handlers.post_comment_and_remove_label", new_callable=AsyncMock),
+            patch("src.events.handlers.remove_trigger_label", new_callable=AsyncMock),
             patch("src.events.handlers.AgentHandler._refresh_gh_token", new_callable=AsyncMock),
         ):
             await agent_handler.handle_webhook(event)
@@ -266,7 +266,7 @@ class TestAgentHandler:
         event = self._make_github_label_event(title="Broken button")
 
         with (
-            patch("src.events.handlers.post_comment_and_remove_label", new_callable=AsyncMock),
+            patch("src.events.handlers.remove_trigger_label", new_callable=AsyncMock),
             patch("src.events.handlers.AgentHandler._refresh_gh_token", new_callable=AsyncMock),
         ):
             await agent_handler.handle_webhook(event)
