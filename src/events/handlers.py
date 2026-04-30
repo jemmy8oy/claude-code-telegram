@@ -5,12 +5,14 @@ NotificationHandler: subscribes to AgentResponseEvent and delivers to Telegram.
 """
 
 import asyncio
+import json
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import structlog
 
+from ..claude.exceptions import ClaudeRateLimitError
 from ..claude.facade import ClaudeIntegration
 from ..github.label_workflow import (
     LABEL_ACTION_READY,
@@ -18,6 +20,7 @@ from ..github.label_workflow import (
     post_error_comment,
     remove_trigger_label,
 )
+from ..storage.queue_repository import QueuedEventRepository
 from .bus import Event, EventBus
 from .types import AgentResponseEvent, ScheduledEvent, WebhookEvent
 
@@ -33,6 +36,12 @@ class AgentHandler:
     Webhook and scheduled events are converted into prompts and sent
     to ClaudeIntegration.run_command(). The response is published
     back as an AgentResponseEvent for delivery.
+
+    When the Claude API returns a rate-limit error the triggering GitHub
+    event is written to the persistent ``queued_events`` table (via
+    *queue_repo*) so it survives pod restarts.  A separate scheduled drain
+    job calls :meth:`drain_persistent_queue` periodically to replay those
+    items once capacity has recovered.
     """
 
     def __init__(
@@ -41,11 +50,13 @@ class AgentHandler:
         claude_integration: ClaudeIntegration,
         default_working_directory: Path,
         default_user_id: int = 0,
+        queue_repo: Optional[QueuedEventRepository] = None,
     ) -> None:
         self.event_bus = event_bus
         self.claude = claude_integration
         self.default_working_directory = default_working_directory
         self.default_user_id = default_user_id
+        self.queue_repo = queue_repo
 
     def register(self) -> None:
         """Subscribe to events that need agent processing."""
@@ -273,6 +284,43 @@ class AgentHandler:
                         originating_event_id=event.id,
                     )
                 )
+        except ClaudeRateLimitError as exc:
+            logger.warning(
+                "Claude API rate limit hit — queuing event for retry",
+                repo=gh_repo,
+                number=gh_number,
+                event_id=event.id,
+                error=str(exc),
+            )
+            if self.queue_repo and gh_repo and gh_number:
+                await self.queue_repo.enqueue(
+                    repo=gh_repo,
+                    number=gh_number,
+                    kind=gh_kind,
+                    label=label_name,
+                    payload=event.payload,
+                )
+                await self.event_bus.publish(
+                    AgentResponseEvent(
+                        chat_id=0,
+                        text=(
+                            f"⏰ Claude rate limit hit — "
+                            f"{gh_repo}#{gh_number} queued for automatic retry."
+                        ),
+                        originating_event_id=event.id,
+                    )
+                )
+            else:
+                # No queue configured — fall back to error comment so the
+                # developer at least sees the failure.
+                if gh_repo and gh_number:
+                    await post_error_comment(
+                        repo=gh_repo,
+                        number=gh_number,
+                        error=str(exc),
+                        trigger_label=label_name,
+                    )
+
         except Exception as exc:
             logger.exception(
                 "Agent execution failed for GitHub webhook event",
@@ -309,6 +357,239 @@ class AgentHandler:
                 "GH_TOKEN refresh failed — proceeding with existing token",
                 stderr=stderr.decode("utf-8", errors="replace").strip(),
             )
+
+    # ------------------------------------------------------------------
+    # Persistent queue drain
+    # ------------------------------------------------------------------
+
+    async def drain_persistent_queue(self, max_retries: int = 10) -> None:
+        """Attempt to replay events that were queued due to a rate limit.
+
+        Called by the APScheduler drain job at a configurable interval.
+
+        Design:
+        - Fetch pending items oldest-first (up to a reasonable batch).
+        - For each item, re-verify the trigger label is still present.
+        - Attempt ``run_command()``; on success dequeue and remove the label.
+        - On :class:`~..claude.exceptions.ClaudeRateLimitError` the rate limit
+          is still active — increment the retry counter and **stop the entire
+          batch** (global retry: no point attempting remaining items).
+        - After ``max_retries`` failed attempts the item is abandoned: the
+          ``ai-error`` label is applied and a Telegram alert is sent.
+
+        Args:
+            max_retries: Abandon items whose ``retry_count`` reaches this value.
+        """
+        if not self.queue_repo:
+            return
+
+        pending = await self.queue_repo.list_pending(max_retries=max_retries)
+        if not pending:
+            logger.debug("Persistent queue is empty — nothing to drain")
+            return
+
+        logger.info("Draining persistent event queue", pending_count=len(pending))
+
+        for item in pending:
+            repo: str = item["repo"]
+            number: int = item["number"]
+            kind: str = item["kind"]
+            label: str = item["label"]
+            payload: Dict[str, Any] = item["payload"]
+            item_id: int = item["id"]
+            retry_count: int = item["retry_count"]
+
+            # 1. Re-verify that the trigger label is still on the issue/PR.
+            #    If it has been removed (human cancelled, already handled, etc.)
+            #    silently drop the queued item.
+            if not await self._label_still_present(repo, number, label):
+                logger.info(
+                    "Trigger label no longer present — dropping queued item",
+                    repo=repo,
+                    number=number,
+                    label=label,
+                )
+                await self.queue_repo.dequeue(item_id)
+                continue
+
+            # 2. Refresh GH_TOKEN and attempt replay.
+            await self._refresh_gh_token()
+
+            # Reconstruct a minimal WebhookEvent so _build_github_prompt()
+            # can derive the prompt from the original payload without needing
+            # to re-fetch anything from GitHub.
+            mock_event = WebhookEvent(
+                provider="github",
+                event_type_name="issues" if kind == "issue" else "pull_request",
+                payload=payload,
+            )
+            is_action_ready = label == LABEL_ACTION_READY and kind == "issue"
+            prompt = self._build_github_prompt(mock_event, action_ready=is_action_ready)
+
+            try:
+                response = await self.claude.run_command(
+                    prompt=prompt,
+                    working_directory=self.default_working_directory,
+                    user_id=self.default_user_id,
+                    force_new=True,
+                )
+
+                # Success — remove from queue and clear the trigger label.
+                await self.queue_repo.dequeue(item_id)
+                await remove_trigger_label(
+                    repo=repo,
+                    number=number,
+                    trigger_label=label,
+                )
+                logger.info(
+                    "Queued event replayed successfully",
+                    repo=repo,
+                    number=number,
+                    retry_count=retry_count,
+                )
+                if response.content:
+                    await self.event_bus.publish(
+                        AgentResponseEvent(
+                            chat_id=0,
+                            text=response.content,
+                            originating_event_id=mock_event.id,
+                        )
+                    )
+
+            except ClaudeRateLimitError:
+                # Rate limit is still active.  Increment the counter and stop
+                # the whole batch — no point trying remaining items.
+                new_count = retry_count + 1
+                await self.queue_repo.mark_attempted(item_id)
+                logger.warning(
+                    "Rate limit still active during drain — stopping batch",
+                    repo=repo,
+                    number=number,
+                    retry_count=new_count,
+                    max_retries=max_retries,
+                )
+                if new_count >= max_retries:
+                    await self._abandon_queued_item(
+                        item_id=item_id,
+                        repo=repo,
+                        number=number,
+                        label=label,
+                        retry_count=new_count,
+                        mock_event_id=mock_event.id,
+                    )
+                break  # global stop — wait for the next scheduled interval
+
+            except Exception as exc:
+                # Genuine processing error (not a rate limit).  Increment and,
+                # if exhausted, abandon with ai-error.
+                new_count = retry_count + 1
+                await self.queue_repo.mark_attempted(item_id)
+                logger.exception(
+                    "Error replaying queued event",
+                    repo=repo,
+                    number=number,
+                    retry_count=new_count,
+                )
+                if new_count >= max_retries:
+                    await self._abandon_queued_item(
+                        item_id=item_id,
+                        repo=repo,
+                        number=number,
+                        label=label,
+                        retry_count=new_count,
+                        mock_event_id=mock_event.id,
+                        error=str(exc),
+                    )
+
+    async def _abandon_queued_item(
+        self,
+        item_id: int,
+        repo: str,
+        number: int,
+        label: str,
+        retry_count: int,
+        mock_event_id: str,
+        error: str = "rate limit retries exhausted",
+    ) -> None:
+        """Remove a queued item that has exhausted its retry budget.
+
+        Applies ``ai-error``, posts an error comment, sends a Telegram alert,
+        and deletes the row from the queue.
+
+        Args:
+            item_id:       DB primary key of the queued_events row.
+            repo:          Full repository name.
+            number:        Issue or PR number.
+            label:         The trigger label (for the error comment).
+            retry_count:   Final retry count (for the alert message).
+            mock_event_id: ID from the synthetic WebhookEvent used for replay.
+            error:         Short description to include in the GitHub comment.
+        """
+        await self.queue_repo.dequeue(item_id)
+        await post_error_comment(
+            repo=repo,
+            number=number,
+            error=f"Abandoned after {retry_count} retries: {error}",
+            trigger_label=label,
+        )
+        await self.event_bus.publish(
+            AgentResponseEvent(
+                chat_id=0,
+                text=(
+                    f"⛔ {repo}#{number} abandoned after {retry_count} rate-limit "
+                    f"retries — `ai-error` label applied."
+                ),
+                originating_event_id=mock_event_id,
+            )
+        )
+        logger.error(
+            "Queued event abandoned after max retries",
+            repo=repo,
+            number=number,
+            retry_count=retry_count,
+        )
+
+    async def _label_still_present(
+        self, repo: str, number: int, label: str
+    ) -> bool:
+        """Return True if *label* is currently applied to the issue/PR.
+
+        Uses ``gh issue view --json labels`` which works for both issues and
+        pull requests.  On any CLI error, returns ``True`` (fail-open: better
+        to attempt a replay than to silently drop an item).
+
+        Args:
+            repo:   Full repository name, e.g. ``"owner/repo"``.
+            number: Issue or PR number.
+            label:  Label name to check for.
+        """
+        proc = await asyncio.create_subprocess_exec(
+            "gh", "issue", "view", str(number), "--repo", repo, "--json", "labels",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            logger.warning(
+                "Could not check label presence — assuming present",
+                repo=repo,
+                number=number,
+                label=label,
+                stderr=stderr.decode("utf-8", errors="replace").strip(),
+            )
+            return True
+        try:
+            data = json.loads(stdout.decode())
+            labels = [lbl["name"] for lbl in data.get("labels", [])]
+            return label in labels
+        except Exception:
+            logger.warning(
+                "Failed to parse label JSON — assuming label present",
+                repo=repo,
+                number=number,
+                label=label,
+            )
+            return True
 
     def _build_github_prompt(self, event: WebhookEvent, action_ready: bool = False) -> str:
         """Build a rich prompt for a GitHub issue or PR label event.

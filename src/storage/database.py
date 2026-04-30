@@ -310,6 +310,34 @@ class DatabaseManager:
                     ON project_threads(project_slug);
                 """,
             ),
+            (
+                5,
+                """
+                -- Persistent event queue for rate-limit retry
+                --
+                -- When the Claude API returns a rate-limit error the triggering
+                -- GitHub event is written here instead of being silently dropped.
+                -- A scheduled drain job re-attempts processing at a configurable
+                -- interval.  Items are keyed by (repo, number) so that multiple
+                -- webhooks for the same issue/PR collapse to the latest payload
+                -- (INSERT OR REPLACE semantics).
+                CREATE TABLE IF NOT EXISTS queued_events (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    repo             TEXT    NOT NULL,
+                    number           INTEGER NOT NULL,
+                    kind             TEXT    NOT NULL,  -- 'issue' | 'pull_request'
+                    label            TEXT    NOT NULL,  -- trigger label name
+                    payload          TEXT    NOT NULL,  -- JSON WebhookEvent.payload
+                    queued_at        TEXT    NOT NULL DEFAULT (datetime('now')),
+                    retry_count      INTEGER NOT NULL DEFAULT 0,
+                    last_attempted_at TEXT,
+                    UNIQUE(repo, number)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_queued_events_retry
+                    ON queued_events(retry_count, queued_at);
+                """,
+            ),
         ]
 
     async def _init_pool(self):

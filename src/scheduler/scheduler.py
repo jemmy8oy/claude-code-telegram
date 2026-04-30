@@ -5,13 +5,14 @@ to the event bus when jobs fire.
 """
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 import structlog
 from apscheduler.schedulers.asyncio import (
     AsyncIOScheduler,  # type: ignore[import-untyped]
 )
 from apscheduler.triggers.cron import CronTrigger  # type: ignore[import-untyped]
+from apscheduler.triggers.interval import IntervalTrigger  # type: ignore[import-untyped]
 
 from ..events.bus import EventBus
 from ..events.types import ScheduledEvent
@@ -34,9 +35,38 @@ class JobScheduler:
         self.default_working_directory = default_working_directory
         self._scheduler = AsyncIOScheduler()
 
-    async def start(self) -> None:
-        """Load persisted jobs and start the scheduler."""
+    async def start(
+        self,
+        drain_callback: Optional[Callable[[], Coroutine[Any, Any, None]]] = None,
+        drain_interval_minutes: int = 5,
+    ) -> None:
+        """Load persisted jobs and start the scheduler.
+
+        Args:
+            drain_callback:         Async callable (no args) to invoke when the
+                                    persistent queue drain job fires.  When
+                                    *None* no drain job is registered.
+            drain_interval_minutes: How often to run the drain job (minutes).
+                                    Ignored when *drain_callback* is ``None``.
+        """
         await self._load_jobs_from_db()
+
+        if drain_callback is not None:
+            self._scheduler.add_job(
+                drain_callback,
+                trigger=IntervalTrigger(minutes=drain_interval_minutes),
+                id="_system_queue_drain",
+                name="Persistent queue drain",
+                replace_existing=True,
+                # mis-fire grace: if the pod was down for less than the interval
+                # run immediately on startup, otherwise skip stale fires.
+                misfire_grace_time=60,
+            )
+            logger.info(
+                "Persistent queue drain job registered",
+                interval_minutes=drain_interval_minutes,
+            )
+
         self._scheduler.start()
         logger.info("Job scheduler started")
 

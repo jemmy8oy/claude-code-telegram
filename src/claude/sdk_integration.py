@@ -36,6 +36,7 @@ from .exceptions import (
     ClaudeMCPError,
     ClaudeParsingError,
     ClaudeProcessError,
+    ClaudeRateLimitError,
     ClaudeTimeoutError,
 )
 from .monitor import _is_claude_internal_path, check_bash_directory_boundary
@@ -44,6 +45,18 @@ logger = structlog.get_logger()
 
 # Fallback message when Claude produces no text but did use tools.
 TASK_COMPLETED_MSG = "✅ Task completed. Tools used: {tools_summary}"
+
+# Substrings that indicate a transient API rate-limit / capacity error rather
+# than a code bug.  Checked case-insensitively against the full error string.
+_RATE_LIMIT_PHRASES: frozenset[str] = frozenset(
+    ["rate limit", "rate_limit", "429", "too many requests", "overloaded", "quota exceeded"]
+)
+
+
+def _is_rate_limit_error(message: str) -> bool:
+    """Return True if *message* looks like a transient rate-limit error."""
+    lower = message.lower()
+    return any(phrase in lower for phrase in _RATE_LIMIT_PHRASES)
 
 
 @dataclass
@@ -640,6 +653,9 @@ class ClaudeSDKManager:
                 exit_code=getattr(e, "exit_code", None),
                 stderr=captured_stderr or None,
             )
+            # Rate-limit check before MCP/generic classification
+            if _is_rate_limit_error(error_str):
+                raise ClaudeRateLimitError(f"Claude API rate limit reached: {error_str}")
             # Check if the process error is MCP-related
             if "mcp" in error_str.lower():
                 raise ClaudeMCPError(f"MCP server error: {error_str}")
@@ -648,6 +664,9 @@ class ClaudeSDKManager:
         except CLIConnectionError as e:
             error_str = str(e)
             logger.error("Claude connection error", error=error_str)
+            # Rate-limit check before MCP/generic classification
+            if _is_rate_limit_error(error_str):
+                raise ClaudeRateLimitError(f"Claude API rate limit reached: {error_str}")
             # Check if the connection error is MCP-related
             if "mcp" in error_str.lower() or "server" in error_str.lower():
                 raise ClaudeMCPError(f"MCP server connection failed: {error_str}")
