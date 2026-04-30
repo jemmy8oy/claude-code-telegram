@@ -299,6 +299,24 @@ class Settings(BaseSettings):
     enable_api_server: bool = Field(False, description="Enable FastAPI webhook server")
     api_server_port: int = Field(8080, description="Webhook API server port")
     enable_scheduler: bool = Field(False, description="Enable job scheduler")
+
+    # Persistent queue / rate-limit retry settings
+    queue_retry_interval_minutes: int = Field(
+        5,
+        ge=1,
+        description=(
+            "How often (minutes) the drain job checks the persistent event queue "
+            "for items to replay after a rate-limit. Requires ENABLE_SCHEDULER=true."
+        ),
+    )
+    queue_max_retries: int = Field(
+        10,
+        ge=1,
+        description=(
+            "Maximum number of drain attempts per queued event before it is "
+            "abandoned and ai-error is applied to the issue/PR."
+        ),
+    )
     github_webhook_secret: Optional[str] = Field(
         None, description="GitHub webhook HMAC secret"
     )

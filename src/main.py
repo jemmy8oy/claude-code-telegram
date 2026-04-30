@@ -36,6 +36,7 @@ from src.security.auth import (
 from src.security.rate_limiter import RateLimiter
 from src.security.validators import SecurityValidator
 from src.storage.facade import Storage
+from src.storage.queue_repository import QueuedEventRepository
 from src.storage.session_storage import SQLiteSessionStorage
 
 
@@ -161,12 +162,16 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     )
     event_security.register()
 
+    # Persistent queue repository (used by AgentHandler for rate-limit retry)
+    queue_repo = QueuedEventRepository(storage.db_manager)
+
     # Agent handler — translates events into Claude executions
     agent_handler = AgentHandler(
         event_bus=event_bus,
         claude_integration=claude_integration,
         default_working_directory=config.approved_directory,
         default_user_id=config.allowed_users[0] if config.allowed_users else 0,
+        queue_repo=queue_repo,
     )
     agent_handler.register()
 
@@ -199,6 +204,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         "features": features,
         "event_bus": event_bus,
         "agent_handler": agent_handler,
+        "queue_repo": queue_repo,
         "auth_manager": auth_manager,
         "security_validator": security_validator,
     }
@@ -213,6 +219,8 @@ async def run_application(app: Dict[str, Any]) -> None:
     config: Settings = app["config"]
     features: FeatureFlags = app["features"]
     event_bus: EventBus = app["event_bus"]
+    agent_handler: AgentHandler = app["agent_handler"]
+    queue_repo: QueuedEventRepository = app["queue_repo"]
 
     notification_service: Optional[NotificationService] = None
     scheduler: Optional[JobScheduler] = None
@@ -289,6 +297,22 @@ async def run_application(app: Dict[str, Any]) -> None:
         notification_service.register()
         await notification_service.start()
 
+        # Replay any events that were queued before a pod restart.
+        # This runs regardless of whether the scheduler is enabled.
+        startup_pending = await queue_repo.count_pending(
+            max_retries=config.queue_max_retries
+        )
+        if startup_pending > 0:
+            logger.info(
+                "Found queued events from before restart — scheduling immediate drain",
+                count=startup_pending,
+            )
+            asyncio.create_task(
+                agent_handler.drain_persistent_queue(
+                    max_retries=config.queue_max_retries
+                )
+            )
+
         # Collect concurrent tasks
         tasks = []
 
@@ -306,15 +330,23 @@ async def run_application(app: Dict[str, Any]) -> None:
             tasks.append(api_task)
             logger.info("API server enabled", port=config.api_server_port)
 
-        # Scheduler (if enabled)
+        # Scheduler (if enabled) — also registers the persistent queue drain job
         if features.scheduler_enabled:
             scheduler = JobScheduler(
                 event_bus=event_bus,
                 db_manager=storage.db_manager,
                 default_working_directory=config.approved_directory,
             )
-            await scheduler.start()
-            logger.info("Job scheduler enabled")
+            await scheduler.start(
+                drain_callback=lambda: agent_handler.drain_persistent_queue(
+                    max_retries=config.queue_max_retries
+                ),
+                drain_interval_minutes=config.queue_retry_interval_minutes,
+            )
+            logger.info(
+                "Job scheduler enabled with queue drain",
+                drain_interval_minutes=config.queue_retry_interval_minutes,
+            )
 
         # Shutdown task
         shutdown_task = asyncio.create_task(shutdown_event.wait())
